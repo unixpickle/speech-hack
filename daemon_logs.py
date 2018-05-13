@@ -11,10 +11,16 @@ from threading import Thread
 import lldb
 
 TEMP_DIR = '(char *)[NSTemporaryDirectory() UTF8String]'
-GEN_SAMPLES = 'MTBEPhraseProcessor::GenerateSamples'
-MEOW_DEBUG = 'MTBEDebugFlags::sMEOWDebug'
 STDERR_SYMBOL = '__stderrp'
 MACINTALK_MODULE = 'MacinTalk'
+
+MEOW_DEBUG_HOOK = 'MTBEPhraseProcessor::GenerateSamples'
+WORKER_DEBUG_HOOK = 'MTBEWorker::DebugLog'
+
+MEOW_DEBUG_FLAG = 'MTBEDebugFlags::sMEOWDebug'
+WORKER_DEBUG_FLAG = 'MTBEDebugFlags::sMTXDebug'
+
+DONE_AUDIO_HOOK = 'MTBEAudioFileSoundOutput::Disengage'
 
 
 def main(pid):
@@ -26,13 +32,20 @@ def main(pid):
         print(stream.readline().strip())
 
 
-def dump_logs_async(pid, log_fn=lambda x: None):
+def dump_logs_async(pid, log_fn=lambda x: None, log_meow=True, log_worker=False,
+                    log_done_audio=False):
     """
     Setup the speechsynthesisd process to send logs to us.
 
     Args:
       pid: the process ID of speechsynthesisd.
-      log_fn: a function to call with log messages.
+      log_fn: a function to call with internal log
+        messages.
+      log_meow: whether or not to capture MEOW logs.
+      log_worker: whether or not to capture worker logs.
+      log_done_audio: enable a special debug log that
+        prints "*** AUDIO CLOSED **" when an output audio
+        file is closed.
 
     Returns:
       A file handle for reading logs.
@@ -47,14 +60,22 @@ def dump_logs_async(pid, log_fn=lambda x: None):
     log_fn('creating FIFO...')
     our_fifo, their_fifo = setup_log_fifo(stopped_thread(process))
 
-    log_fn('creating breakpoint...')
-    try_breakpoint(target.BreakpointCreateByName(GEN_SAMPLES))
+    log_fn('creating breakpoint(s)...')
+    if log_meow:
+        try_breakpoint(target.BreakpointCreateByName(MEOW_DEBUG_HOOK))
+    if log_worker:
+        try_breakpoint(target.BreakpointCreateByName(WORKER_DEBUG_HOOK))
+    if log_done_audio:
+        try_breakpoint(target.BreakpointCreateByName(DONE_AUDIO_HOOK))
 
-    log_fn('finding MEOW symbol...')
-    meow_sym = find_symbol(target, MEOW_DEBUG)
+    log_fn('finding debug flag symbols...')
+    meow_flag = find_symbol(target, MEOW_DEBUG_FLAG)
+    worker_flag = find_symbol(target, WORKER_DEBUG_FLAG)
 
     log_fn('overwriting standard error...')
     replace_stderr(target, process, their_fifo)
+
+    log_fn('done setup.')
 
     def manage_thread():
         try_sb_error(process.Continue())
@@ -68,8 +89,12 @@ def dump_logs_async(pid, log_fn=lambda x: None):
                 continue
             try:
                 sym_name = thread.GetFrameAtIndex(0).GetSymbol().GetName()
-                if GEN_SAMPLES in sym_name:
-                    enable_debugging(target, process, meow_sym)
+                if MEOW_DEBUG_HOOK in sym_name:
+                    set_debug_flag(target, process, meow_flag)
+                elif WORKER_DEBUG_HOOK in sym_name:
+                    set_debug_flag(target, process, worker_flag)
+                elif DONE_AUDIO_HOOK in sym_name:
+                    write_log(thread, their_fifo, '*** AUDIO CLOSED ***')
             finally:
                 try_sb_error(process.Continue())
 
@@ -127,6 +152,25 @@ def enable_line_buffering(frame, fifo_value):
     frame.EvaluateExpression('(int)setvbuf(' + str(address) + ', 0, 1, 512)')
 
 
+def write_log(thread, fifo_value, message):
+    """
+    Write a log message on behalf of the process.
+
+    Args:
+      thread: a stopped SBThread.
+      fifo_value: the SBValue of the FILE*.
+      message: the message to log. Should not contain
+        backslashes or quotation marks.
+    """
+    assert '\\' not in message and '"' not in message, 'log messages are not escaped'
+    frame = thread.GetFrameAtIndex(0)
+    error = lldb.SBError()
+    address = fifo_value.GetData().GetAddress(error, 0)
+    try_sb_error(error)
+    code = '(int)fprintf((void *)' + str(address) + ', (char *)"' + message + '\\n")'
+    print(frame.EvaluateExpression(code))
+
+
 def find_symbol(target, name, module=MACINTALK_MODULE):
     """
     Find an SBSymbol by the given name.
@@ -140,12 +184,12 @@ def find_symbol(target, name, module=MACINTALK_MODULE):
     raise RuntimeError('symbol not found: ' + name)
 
 
-def enable_debugging(target, process, meow_sym):
+def set_debug_flag(target, process, flag_sym):
     """
-    Enable "MEOW" debug logs.
+    Enable a debug flag.
     """
     error = lldb.SBError()
-    addr = meow_sym.GetStartAddress()
+    addr = flag_sym.GetStartAddress()
     process.WriteMemory(addr.GetLoadAddress(target), '\x01', error)
     try_sb_error(error)
 

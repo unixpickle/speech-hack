@@ -13,8 +13,9 @@ import lldb
 
 TEMP_DIR = '(char *)[NSTemporaryDirectory() UTF8String]'
 GEN_SAMPLES = 'MTBEPhraseProcessor::GenerateSamples'
-DEMI_DUMP = 'Demi::Dump(__sFILE*)'
 MEOW_DEBUG = 'MTBEDebugFlags::sMEOWDebug'
+STDERR_SYMBOL = '__stderrp'
+MACINTALK_MODULE = 'MacinTalk'
 
 
 def main(pid):
@@ -47,12 +48,14 @@ def dump_logs_async(pid, log_fn=lambda x: None):
     log_fn('creating FIFO...')
     our_fifo, their_fifo = setup_log_fifo(stopped_thread(process))
 
-    log_fn('creating breakpoints...')
-    try_breakpoint(target.BreakpointCreateByName(DEMI_DUMP))
+    log_fn('creating breakpoint...')
     try_breakpoint(target.BreakpointCreateByName(GEN_SAMPLES))
 
     log_fn('finding MEOW symbol...')
     meow_sym = find_symbol(target, MEOW_DEBUG)
+
+    log_fn('overwriting standard error...')
+    replace_stderr(target, process, their_fifo)
 
     def manage_thread():
         try_sb_error(process.Continue())
@@ -68,8 +71,6 @@ def dump_logs_async(pid, log_fn=lambda x: None):
                 sym_name = thread.GetFrameAtIndex(0).GetSymbol().GetName()
                 if GEN_SAMPLES in sym_name:
                     enable_debugging(target, process, meow_sym)
-                elif DEMI_DUMP in sym_name:
-                    swap_out_stderr(thread, their_fifo)
             finally:
                 try_sb_error(process.Continue())
 
@@ -127,11 +128,13 @@ def enable_line_buffering(frame, fifo_value):
     frame.EvaluateExpression('(int)setvbuf(' + str(address) + ', 0, 0)')
 
 
-def find_symbol(target, name):
+def find_symbol(target, name, module=MACINTALK_MODULE):
     """
     Find an SBSymbol by the given name.
     """
     for mod in target.module_iter():
+        if module and module != mod.GetFileSpec().GetFilename():
+            continue
         for sym in mod:
             if sym.GetName() == name:
                 return sym
@@ -148,20 +151,25 @@ def enable_debugging(target, process, meow_sym):
     try_sb_error(error)
 
 
-def swap_out_stderr(thread, fifo_value):
+def replace_stderr(target, process, fifo_value):
     """
-    Replace the argument to Demi::Dump() with a FIFO.
+    Replace ___stderrp with a FILE* SBValue.
 
     Args:
-      thread: an SBThread to change.
+      target: an SBTarget to change.
       fifo_value: an SBValue representing the result of an
         fopen() call.
     """
-    frame = thread.GetFrameAtIndex(0)
-    reg = frame.FindRegister('rsi')
-    error = lldb.SBError()
-    reg.SetData(fifo_value.GetData(), error)
-    try_sb_error(error)
+    for mod in target.module_iter():
+        for sym in mod:
+            if sym.GetName() == STDERR_SYMBOL:
+                if sym.GetStartAddress().GetOffset() != 0:
+                    addr = sym.GetStartAddress().GetLoadAddress(target)
+                    error = lldb.SBError()
+                    str_val = fifo_value.GetData().GetString(error, 0)
+                    try_sb_error(error)
+                    process.WriteMemory(addr, str_val, error)
+                    try_sb_error(error)
 
 
 def log(msg):

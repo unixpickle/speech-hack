@@ -9,7 +9,7 @@ from random import random
 import sys
 from threading import Event, Thread
 
-import lldb
+import lldb  # pylint: disable=E0401
 
 TEMP_DIR = '(char *)[NSTemporaryDirectory() UTF8String]'
 STDERR_SYMBOL = '__stderrp'

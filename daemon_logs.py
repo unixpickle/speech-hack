@@ -124,7 +124,7 @@ def enable_line_buffering(frame, fifo_value):
     error = lldb.SBError()
     address = fifo_value.GetData().GetAddress(error, 0)
     try_sb_error(error)
-    frame.EvaluateExpression('(int)setvbuf(' + str(address) + ', 0, 0)')
+    frame.EvaluateExpression('(int)setvbuf(' + str(address) + ', 0, 1, 512)')
 
 
 def find_symbol(target, name, module=MACINTALK_MODULE):

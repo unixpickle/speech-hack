@@ -168,7 +168,7 @@ def write_log(thread, fifo_value, message):
     address = fifo_value.GetData().GetAddress(error, 0)
     try_sb_error(error)
     code = '(int)fprintf((void *)' + str(address) + ', (char *)"' + message + '\\n")'
-    print(frame.EvaluateExpression(code))
+    frame.EvaluateExpression(code)
 
 
 def find_symbol(target, name, module=MACINTALK_MODULE):

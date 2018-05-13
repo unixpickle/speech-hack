@@ -3,11 +3,11 @@ Latch on to the speechsynthesisd process and dump its
 logs.
 """
 
+import fcntl
 import os
 from random import random
 import sys
 from threading import Thread
-from time import sleep
 
 import lldb
 
@@ -17,9 +17,25 @@ DEMI_DUMP = 'Demi::Dump(__sFILE*)'
 MEOW_DEBUG = 'MTBEDebugFlags::sMEOWDebug'
 
 
-def setup_log_dumping(pid):
+def main(pid):
     """
-    Setup the process `pid` to dump it's "MEOW" logs.
+    Setup log dumping and forward it to stdout.
+    """
+    stream = dump_logs_async(pid, log_fn=log)
+    while True:
+        print(stream.readline().strip())
+
+
+def dump_logs_async(pid, log_fn=lambda x: None):
+    """
+    Setup the speechsynthesisd process to send logs to us.
+
+    Args:
+      pid: the process ID of speechsynthesisd.
+      log_fn: a function to call with log messages.
+
+    Returns:
+      A file handle for reading logs.
     """
     debugger = lldb.SBDebugger.Create()
     listener = debugger.GetListener()
@@ -28,36 +44,39 @@ def setup_log_dumping(pid):
     process = target.AttachToProcessWithID(listener, pid, error)
     try_sb_error(error)
 
-    log('creating FIFO...')
+    log_fn('creating FIFO...')
     our_fifo, their_fifo = setup_log_fifo(stopped_thread(process))
-    log('creating breakpoints...')
+
+    log_fn('creating breakpoints...')
     try_breakpoint(target.BreakpointCreateByName(DEMI_DUMP))
     try_breakpoint(target.BreakpointCreateByName(GEN_SAMPLES))
-    log('finding MEOW symbol...')
-    meow_sym = find_meow_sym(target)
 
-    echo_from_fifo(our_fifo)
+    log_fn('finding MEOW symbol...')
+    meow_sym = find_symbol(target, MEOW_DEBUG)
 
-    try_sb_error(process.Continue())
-    log('waiting for breakpoint...')
-    while True:
-        # https://github.com/llvm-mirror/lldb/blob/master/examples/python/process_events.py
-        event = lldb.SBEvent()
-        if not listener.WaitForEvent(1, event):
-            continue
-        thread = stopped_thread(process)
-        if not thread:
-            continue
-        try:
-            sym_name = thread.GetFrameAtIndex(0).GetSymbol().GetName()
-            if GEN_SAMPLES in sym_name:
-                enable_debugging(target, process, meow_sym)
-            elif DEMI_DUMP in sym_name:
-                swap_out_stderr(thread, their_fifo)
-            else:
-                log('unexpected stop symbol: ' + sym_name)
-        finally:
-            try_sb_error(process.Continue())
+    def manage_thread():
+        try_sb_error(process.Continue())
+        while True:
+            # https://github.com/llvm-mirror/lldb/blob/master/examples/python/process_events.py
+            event = lldb.SBEvent()
+            if not listener.WaitForEvent(1, event):
+                continue
+            thread = stopped_thread(process)
+            if not thread:
+                continue
+            try:
+                sym_name = thread.GetFrameAtIndex(0).GetSymbol().GetName()
+                if GEN_SAMPLES in sym_name:
+                    enable_debugging(target, process, meow_sym)
+                elif DEMI_DUMP in sym_name:
+                    swap_out_stderr(thread, their_fifo)
+            finally:
+                try_sb_error(process.Continue())
+
+    th = Thread(target=manage_thread)
+    th.daemon = True
+    th.start()
+    return our_fifo
 
 
 def stopped_thread(process):
@@ -87,51 +106,41 @@ def setup_log_fifo(thread):
     log_out_path = os.path.join(temp_dir, 'socket' + str(random()))
     os.mkfifo(log_out_path)
 
-    our_fifo = []
-
-    def open_ours():
-        our_fifo.append(open(log_out_path, 'r'))
-
-    # Major hack to get around the fact that we're using
-    # FIFOs in totally the wrong way.
-    th = Thread(target=open_ours)
-    th.daemon = True
-    th.start()
-    sleep(0.5)
+    our_fifo = os.open(log_out_path, os.O_RDONLY | os.O_NONBLOCK)
+    flags = fcntl.fcntl(our_fifo, fcntl.F_GETFL)
+    fcntl.fcntl(our_fifo, fcntl.F_SETFL, flags ^ os.O_NONBLOCK)
+    our_fifo = os.fdopen(our_fifo, 'r')
 
     their_fifo = frame.EvaluateExpression('(void *)fopen("' + log_out_path + '", "w")')
+    enable_line_buffering(frame, their_fifo)
 
-    # Enable line buffering.
+    return our_fifo, their_fifo
+
+
+def enable_line_buffering(frame, fifo_value):
+    """
+    Enable line buffering for a FILE* SBValue.
+    """
     error = lldb.SBError()
-    address = their_fifo.GetData().GetAddress(error, 0)
+    address = fifo_value.GetData().GetAddress(error, 0)
     try_sb_error(error)
     frame.EvaluateExpression('(int)setvbuf(' + str(address) + ', 0, 0)')
 
-    th.join()
-    return our_fifo[0], their_fifo
 
-
-def echo_from_fifo(our_fifo):
+def find_symbol(target, name):
     """
-    Run a background thread that echos our_fifo to stdout.
+    Find an SBSymbol by the given name.
     """
-    def echo_thread():
-        while True:
-            print(our_fifo.readline().strip())
-    Thread(target=echo_thread).start()
-
-
-def find_meow_sym(target):
     for mod in target.module_iter():
         for sym in mod:
-            if sym.GetName() == MEOW_DEBUG:
+            if sym.GetName() == name:
                 return sym
-    raise RuntimeError('no symbol found: ' + MEOW_DEBUG)
+    raise RuntimeError('symbol not found: ' + name)
 
 
 def enable_debugging(target, process, meow_sym):
     """
-    Enable MEOW debugging.
+    Enable "MEOW" debug logs.
     """
     error = lldb.SBError()
     addr = meow_sym.GetStartAddress()
@@ -139,14 +148,19 @@ def enable_debugging(target, process, meow_sym):
     try_sb_error(error)
 
 
-def swap_out_stderr(thread, their_fifo):
+def swap_out_stderr(thread, fifo_value):
     """
-    Replace the argument to Demi::Dump() with our FIFO.
+    Replace the argument to Demi::Dump() with a FIFO.
+
+    Args:
+      thread: an SBThread to change.
+      fifo_value: an SBValue representing the result of an
+        fopen() call.
     """
     frame = thread.GetFrameAtIndex(0)
     reg = frame.FindRegister('rsi')
     error = lldb.SBError()
-    reg.SetData(their_fifo.GetData(), error)
+    reg.SetData(fifo_value.GetData(), error)
     try_sb_error(error)
 
 
@@ -168,4 +182,4 @@ if __name__ == '__main__':
     if len(sys.argv) != 2:
         sys.stderr.write('Usage: dump_meow_logs.py <pid>\n')
         sys.exit(1)
-    setup_log_dumping(int(sys.argv[1]))
+    main(int(sys.argv[1]))

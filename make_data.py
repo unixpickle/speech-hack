@@ -1,6 +1,32 @@
 """
 Create a dataset of audio files coupled with unit
 alignments extracted from speechsynthesisd.
+
+Produces files that look like this:
+
+    {
+      "sentence": "this is a test",
+      "units": [
+        {
+          "samples": 110,
+          "unit": "SIL"
+        },
+        {
+          "samples": 6154,
+          "unit": "THIS"
+        },
+        {
+          "samples": 2254,
+          "unit": "IS"
+        },
+        {
+          "samples": 433,
+          "unit": "z<"
+        },
+        ...
+      ]
+    }
+
 """
 
 import argparse

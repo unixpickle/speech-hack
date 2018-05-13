@@ -3,10 +3,11 @@ Latch on to speechsynthesisd and stream its logs.
 """
 
 import fcntl
+from functools import partial
 import os
 from random import random
 import sys
-from threading import Thread
+from threading import Event, Thread
 
 import lldb
 
@@ -27,81 +28,110 @@ def main(pid):
     """
     Setup log dumping and forward it to stdout.
     """
-    stream = dump_logs_async(pid, log_fn=log)
-    while True:
-        print(stream.readline().strip())
-
-
-def dump_logs_async(pid, log_fn=lambda x: None, log_meow=True, log_worker=False,
-                    log_done_audio=False):
-    """
-    Setup the speechsynthesisd process to send logs to us.
-
-    Args:
-      pid: the process ID of speechsynthesisd.
-      log_fn: a function to call with internal log
-        messages.
-      log_meow: whether or not to capture MEOW logs.
-      log_worker: whether or not to capture worker logs.
-      log_done_audio: enable a special debug log that
-        prints "*** AUDIO CLOSED **" when an output audio
-        file is closed.
-
-    Returns:
-      A file handle for reading logs.
-    """
-    debugger = lldb.SBDebugger.Create()
-    listener = debugger.GetListener()
-    target = debugger.CreateTarget('')
-    error = lldb.SBError()
-    process = target.AttachToProcessWithID(listener, pid, error)
-    try_sb_error(error)
-
-    log_fn('creating FIFO...')
-    our_fifo, their_fifo = setup_log_fifo(stopped_thread(process))
-
-    log_fn('creating breakpoint(s)...')
-    if log_meow:
-        try_breakpoint(target.BreakpointCreateByName(MEOW_DEBUG_HOOK))
-    if log_worker:
-        try_breakpoint(target.BreakpointCreateByName(WORKER_DEBUG_HOOK))
-    if log_done_audio:
-        try_breakpoint(target.BreakpointCreateByName(DONE_AUDIO_HOOK))
-
-    log_fn('finding debug flag symbols...')
-    meow_flag = find_symbol(target, MEOW_DEBUG_FLAG)
-    worker_flag = find_symbol(target, WORKER_DEBUG_FLAG)
-
-    log_fn('overwriting standard error...')
-    replace_stderr(target, process, their_fifo)
-
-    log_fn('done setup.')
-
-    def manage_thread():
-        try_sb_error(process.Continue())
+    log('Hooking up to daemon...')
+    with LogHook(pid) as logs:
+        log('Reading logs...')
         while True:
+            print(logs.readline().strip())
+
+
+class LogHook:
+    """
+    A context manager that yields a file handle of log
+    messages from speechsynthesisd.
+    """
+
+    def __init__(self,
+                 pid,
+                 log_meow=True,
+                 log_worker=False,
+                 log_done_audio=False):
+        """
+        Configure a hook.
+
+        Args:
+          pid: the process ID of speechsynthesisd.
+          log_meow: whether or not to capture MEOW logs.
+          log_worker: whether or not to capture worker logs.
+          log_done_audio: enable a special debug log that
+            prints "*** AUDIO CLOSED **" when an output audio
+            file is closed.
+        """
+        self.pid = pid
+        self.log_meow = log_meow
+        self.log_worker = log_worker
+        self.log_done_audio = log_done_audio
+        self._attached = None
+
+    def __enter__(self):
+        assert self._attached is None
+        self._attached = _AttachedHook(self.pid, self.log_meow, self.log_worker,
+                                       self.log_done_audio)
+        return self._attached.our_fifo
+
+    def __exit__(self, *args):
+        self._attached.stop()
+        self._attached = None
+
+
+class _AttachedHook:
+    """
+    An attached debugging session.
+    """
+
+    def __init__(self, pid, log_meow, log_worker, log_done_audio):
+        self.done_event = Event()
+
+        self.debugger = lldb.SBDebugger.Create()
+        self.listener = self.debugger.GetListener()
+        self.target = self.debugger.CreateTarget('')
+        error = lldb.SBError()
+        self.process = self.target.AttachToProcessWithID(self.listener, pid, error)
+        try_sb_error(error)
+
+        self.our_fifo, self.their_fifo = setup_log_fifo(stopped_thread(self.process))
+
+        if log_meow:
+            try_breakpoint(self.target.BreakpointCreateByName(MEOW_DEBUG_HOOK))
+        if log_worker:
+            try_breakpoint(self.target.BreakpointCreateByName(WORKER_DEBUG_HOOK))
+        if log_done_audio:
+            try_breakpoint(self.target.BreakpointCreateByName(DONE_AUDIO_HOOK))
+
+        self.meow_flag = find_symbol(self.target, MEOW_DEBUG_FLAG)
+        self.worker_flag = find_symbol(self.target, WORKER_DEBUG_FLAG)
+        self.restore_stderr = replace_stderr(self.target, self.process, self.their_fifo)
+
+        try_sb_error(self.process.Continue())
+        assert not self.done_event.is_set()
+        self.bg_thread = Thread(target=self.poll_thread)
+        self.bg_thread.start()
+
+    def stop(self):
+        self.done_event.set()
+        self.bg_thread.join()
+        self.process.Detach()
+
+    def poll_thread(self):
+        while not self.done_event.is_set():
             # https://github.com/llvm-mirror/lldb/blob/master/examples/python/process_events.py
             event = lldb.SBEvent()
-            if not listener.WaitForEvent(1, event):
+            if not self.listener.WaitForEvent(1, event):
+                self.restore_stderr()
                 continue
-            thread = stopped_thread(process)
+            thread = stopped_thread(self.process)
             if not thread:
                 continue
             try:
                 sym_name = thread.GetFrameAtIndex(0).GetSymbol().GetName()
                 if MEOW_DEBUG_HOOK in sym_name:
-                    set_debug_flag(target, process, meow_flag)
+                    set_debug_flag(self.target, self.process, self.meow_flag)
                 elif WORKER_DEBUG_HOOK in sym_name:
-                    set_debug_flag(target, process, worker_flag)
+                    set_debug_flag(self.target, self.process, self.worker_flag)
                 elif DONE_AUDIO_HOOK in sym_name:
-                    write_log(thread, their_fifo, '*** AUDIO CLOSED ***')
+                    write_log(thread, self.their_fifo, '*** AUDIO CLOSED ***')
             finally:
-                try_sb_error(process.Continue())
-
-    th = Thread(target=manage_thread)
-    th.daemon = True
-    th.start()
-    return our_fifo
+                try_sb_error(self.process.Continue())
 
 
 def stopped_thread(process):
@@ -202,7 +232,11 @@ def replace_stderr(target, process, fifo_value):
       target: an SBTarget to change.
       fifo_value: an SBValue representing the result of an
         fopen() call.
+
+    Returns:
+      A function to restore the old values.
     """
+    restore_fns = []
     for mod in target.module_iter():
         for sym in mod:
             if sym.GetName() == STDERR_SYMBOL:
@@ -211,8 +245,12 @@ def replace_stderr(target, process, fifo_value):
                     error = lldb.SBError()
                     str_val = fifo_value.GetData().GetString(error, 0)
                     try_sb_error(error)
+                    old_value = process.ReadMemory(addr, len(str_val), error)
+                    try_sb_error(error)
                     process.WriteMemory(addr, str_val, error)
                     try_sb_error(error)
+                    restore_fns.append(partial(process.WriteMemory, addr, old_value, error))
+    return lambda: [f() for f in restore_fns]
 
 
 def log(msg):

@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 
-from daemon_logs import dump_logs_async
+from daemon_logs import LogHook
 
 
 def main():
@@ -16,13 +16,14 @@ def main():
     if not os.path.exists(args.out_dir):
         os.mkdir(args.out_dir)
     print('Hooking up to speechsynthesisd...')
-    daemon_log = dump_logs_async(daemon_pid(), log_done_audio=True)
-    with open(args.sentences, 'rt') as in_file:
-        for i, line in enumerate(in_file):
-            line = line.strip()
-            if not line:
-                continue
-            process_sentence(os.path.join(args.out_dir, str(i)), line, daemon_log)
+    with LogHook(daemon_pid(), log_done_audio=True) as daemon_log:
+        print('Processing sentences...')
+        with open(args.sentences, 'rt') as in_file:
+            for i, line in enumerate(in_file):
+                line = line.strip()
+                if not line:
+                    continue
+                process_sentence(os.path.join(args.out_dir, str(i)), line, daemon_log)
 
 
 def process_sentence(out_path, sentence, daemon_log):

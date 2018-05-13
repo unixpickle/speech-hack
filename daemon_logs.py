@@ -1,6 +1,5 @@
 """
-Latch on to the speechsynthesisd process and dump its
-logs.
+Latch on to speechsynthesisd and stream its logs.
 """
 
 import fcntl
